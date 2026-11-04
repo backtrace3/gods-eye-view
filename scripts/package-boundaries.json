@@ -1498,6 +1498,7 @@
     "modules": [
       "src/layers/earthquakes/index.js",
       "src/layers/earthquakes/model.js",
+      "src/layers/earthquakes/cards.js",
       "src/layers/earthquakes/source.js",
       "src/layers/earthquakes/records.js"
     ],
@@ -2539,6 +2540,7 @@
       "src/layers/cctv/testing.js",
       "src/layers/earthquakes/index.js",
       "src/layers/earthquakes/model.js",
+      "src/layers/earthquakes/cards.js",
       "src/layers/earthquakes/source.js",
       "src/layers/firms/anchors.js",
       "src/layers/firms/cards.js",
@@ -3475,6 +3477,7 @@
       "src/layers/cctv/testing.js",
       "src/layers/earthquakes/index.js",
       "src/layers/earthquakes/model.js",
+      "src/layers/earthquakes/cards.js",
       "src/layers/earthquakes/source.js",
       "src/layers/firms/anchors.js",
       "src/layers/firms/cards.js",

@@ -8,15 +8,35 @@ import {
   selectEarthquakeOverlayCohort,
   mapAnalystRecord,
 } from './model.js';
+import { EARTHQUAKE_CARD_SOURCE_ID, buildEarthquakeCard } from './cards.js';
 export * from './model.js';
+export * from './cards.js';
 export { createUsgsEarthquakeSource } from './source.js';
 
 // A portable package (no i18n): the error stays English data and the layer
 // panel shows it translated.
 const msg = (text) => text;
 
-/** Own one earthquake display and its refresh lifecycle. */
-export function createEarthquakesLayer({ source, overlayHost } = {}) {
+const PICK_PREFIX = 'earthquake:';
+const CARD_HOST_OPTIONS = Object.freeze({
+  cohortLimit: 1,
+  collisionCapacity: 1,
+  moving: false,
+});
+
+/**
+ * Own one earthquake display, its refresh lifecycle, and click selection.
+ * Selection is optional: it turns on only when the caller supplies a
+ * screen-space handler factory and the pick registry (the application does).
+ */
+export function createEarthquakesLayer({
+  source,
+  overlayHost,
+  screenSpaceEventHandlerFactory = null,
+  picking = null,
+  pointer = null,
+  now = () => Date.now(),
+} = {}) {
   if (typeof source?.getSnapshot !== 'function')
     throw new TypeError('Earthquakes require a snapshot source');
   if (!overlayHost) throw new TypeError('Earthquakes require an overlay host');
@@ -27,6 +47,102 @@ export function createEarthquakesLayer({ source, overlayHost } = {}) {
   let _lastUpdate = null;
   let _lastError = null;
   let _enabled = false;
+  let _clickHandler = null;
+  let _selectedId = null;
+  /** @type {Map<string, Object>} Latest rows by stable id, for the card. */
+  const _rowById = new Map();
+
+  const canSelect = () => Boolean(screenSpaceEventHandlerFactory && picking);
+
+  function publishSelectedCard() {
+    if (!canSelect()) return;
+    const row = _selectedId ? _rowById.get(_selectedId) : null;
+    if (!row) {
+      _selectedId = null;
+      overlayHost.setEntries(EARTHQUAKE_CARD_SOURCE_ID, [], CARD_HOST_OPTIONS);
+      return;
+    }
+    const card = {
+      ...buildEarthquakeCard(row, now()),
+      position: Cesium.Cartesian3.fromDegrees(row.lon, row.lat),
+    };
+    overlayHost.setEntries(
+      EARTHQUAKE_CARD_SOURCE_ID,
+      [card],
+      CARD_HOST_OPTIONS,
+    );
+  }
+
+  /** Resolve a scene pick to one of this layer's earthquake ids, or null. */
+  function pickedQuakeId(picked) {
+    const pickId = picking.resolvePickId(picked);
+    if (typeof pickId !== 'string' || !pickId.startsWith(PICK_PREFIX))
+      return null;
+    const id = pickId.slice(PICK_PREFIX.length);
+    return _rowById.has(id) ? id : null;
+  }
+
+  function installClickHandler() {
+    if (!canSelect() || _clickHandler || !_viewer?.scene?.canvas) return;
+    // Not registered as a pick owner, for the same reason as fire
+    // perimeters: these are ground discs, and claiming them would make
+    // sibling layers' cards inert anywhere over a quake.
+    try {
+      _clickHandler = screenSpaceEventHandlerFactory(_viewer);
+    } catch (e) {
+      // Selection is a convenience: without a usable canvas (headless
+      // harnesses) the layer still draws, it just can't be clicked.
+      console.warn('[Data:Earthquakes] Click selection unavailable:', e);
+      _clickHandler = null;
+      return;
+    }
+    _clickHandler.setInputAction((click) => {
+      if (pointer && !pointer.isPointerFree()) return;
+      // The "M4.6" tags are the big targets at most zoom levels (the discs
+      // shrink to a few pixels), so a click on a tag selects its quake first.
+      const labelHit = overlayHost.hitTest?.(
+        click.position?.x,
+        click.position?.y,
+        { sourceId: EARTHQUAKE_OVERLAY_SOURCE_ID },
+      );
+      if (labelHit && _rowById.has(String(labelHit.entryId))) {
+        _selectedId = String(labelHit.entryId);
+        publishSelectedCard();
+        return;
+      }
+      const picked = _viewer?.scene?.pick(click.position);
+      const quakeId = picked ? pickedQuakeId(picked) : null;
+      if (quakeId) {
+        _selectedId = quakeId;
+        publishSelectedCard();
+        return;
+      }
+      // A pick that belongs to another layer (an aircraft, a camera) is not
+      // empty space: leave the selection alone and let that layer handle it.
+      if (picked) {
+        const pickId = picking.resolvePickId(picked);
+        if (pickId && picking.isOwnedByOtherLayer(layer.id, pickId)) return;
+      }
+      if (_selectedId) {
+        _selectedId = null;
+        publishSelectedCard();
+      }
+    }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+  }
+
+  function removeClickHandler() {
+    if (_clickHandler) {
+      _clickHandler.destroy();
+      _clickHandler = null;
+    }
+  }
+
+  function clearSelection() {
+    _selectedId = null;
+    if (!canSelect()) return;
+    overlayHost.clearSource(EARTHQUAKE_CARD_SOURCE_ID);
+    overlayHost.setVisible(EARTHQUAKE_CARD_SOURCE_ID, false);
+  }
 
   const layer = {
     id: 'earthquakes',
@@ -55,6 +171,10 @@ export function createEarthquakesLayer({ source, overlayHost } = {}) {
       // layer has no per-frame animator to keep the render loop alive for.
       if (_dataSource) _dataSource.show = true;
       overlayHost.setVisible(EARTHQUAKE_OVERLAY_SOURCE_ID, true);
+      if (canSelect()) {
+        overlayHost.setVisible(EARTHQUAKE_CARD_SOURCE_ID, true);
+        installClickHandler();
+      }
     },
 
     disable(viewer) {
@@ -62,6 +182,8 @@ export function createEarthquakesLayer({ source, overlayHost } = {}) {
       _request = null;
       _enabled = false;
       if (_dataSource) _dataSource.show = false;
+      removeClickHandler();
+      clearSelection();
       overlayHost.clearSource(EARTHQUAKE_OVERLAY_SOURCE_ID);
       overlayHost.setVisible(EARTHQUAKE_OVERLAY_SOURCE_ID, false);
     },
@@ -79,6 +201,8 @@ export function createEarthquakesLayer({ source, overlayHost } = {}) {
         const nextEntities = [];
         let count = 0;
         const overlayEntries = [];
+        _rowById.clear();
+        for (const row of rows) _rowById.set(String(row.stableId), row);
 
         for (const {
           stableId,
@@ -125,14 +249,15 @@ export function createEarthquakesLayer({ source, overlayHost } = {}) {
               },
             }),
           );
-          overlayEntries.push(
-            createEarthquakeOverlayEntry({
-              id: String(stableId),
-              position,
-              magnitude: mag,
-              accent: color.toCssColorString(),
-            }),
-          );
+          const label = createEarthquakeOverlayEntry({
+            id: String(stableId),
+            position,
+            magnitude: mag,
+            accent: color.toCssColorString(),
+          });
+          // Only the overlay's interactive entries get click rectangles.
+          if (canSelect() && overlayHost.hitTest) label.interactive = true;
+          overlayEntries.push(label);
         }
 
         _dataSource.entities.removeAll();
@@ -149,6 +274,9 @@ export function createEarthquakesLayer({ source, overlayHost } = {}) {
           );
         }
 
+        // Refresh an open card (its "x min ago" ages), or close it if the
+        // selected quake fell out of the 24-hour feed.
+        if (_selectedId) publishSelectedCard();
         _count = count;
         _lastUpdate = Date.now();
         _lastError = null;
@@ -168,6 +296,9 @@ export function createEarthquakesLayer({ source, overlayHost } = {}) {
     destroy(viewer = _viewer) {
       _request?.abort();
       _request = null;
+      removeClickHandler();
+      clearSelection();
+      _rowById.clear();
       _viewer = null;
       _enabled = false;
       overlayHost.clearSource(EARTHQUAKE_OVERLAY_SOURCE_ID);
